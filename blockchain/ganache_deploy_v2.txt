@@ -1,0 +1,3 @@
+Compiled 1 Solidity file successfully (evm target: paris).
+Deploying contracts with the account: 0x9b94f7ea3EA41be45B25954e0e587790388e6647
+ExamSystem deployed to: 0xbCa9A1Cd34EFe1E8C56363A1c88F3281Ce7fd6A9

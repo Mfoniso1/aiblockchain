@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+tensorflow
+tensorflow-hub
+numpy
+opencv-python-headless
+scikit-learn
+python-multipart
+requests
+matplotlib
+jupyter
+mediapipe
+ultralytics
+librosa
+soundfile
+
