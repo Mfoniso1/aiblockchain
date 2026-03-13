@@ -10,7 +10,6 @@ __pycache__/
 # ── Large model files (>100 MB — GitHub limit) ────────────────────────────────
 ai_service/exam_fraud_model.h5
 ai_service/dataset.zip
-ai_service/dataset/
 
 # ── Node / Frontend ───────────────────────────────────────────────────────────
 frontend/node_modules/
