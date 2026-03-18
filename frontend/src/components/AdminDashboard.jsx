@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Save, Trash2, LayoutDashboard, List, AlertTriangle, RefreshCw, Shield, BarChart2, Cpu, Link, UserPlus, Users, CheckCircle, XCircle } from 'lucide-react';
+import { Plus, Save, Trash2, LayoutDashboard, List, AlertTriangle, RefreshCw, Shield, BarChart2, Cpu, Link, UserPlus, Users, CheckCircle, XCircle, FileText } from 'lucide-react';
 import { ethers } from 'ethers';
 import ExamSystemABI from '../ExamSystem.json';
-import { CONTRACT_ADDRESS, DEPLOYER } from '../config';
+import FraudLogABI from '../FraudLog.json';
+import { CONTRACT_ADDRESS, FRAUD_LOG_ADDRESS, DEPLOYER } from '../config';
 
 const AdminDashboard = ({ signer }) => {
     const [activeTab, setActiveTab] = useState('create'); // 'create' | 'view' | 'fraud' | 'enroll'
@@ -15,6 +16,12 @@ const AdminDashboard = ({ signer }) => {
     const [createdExams, setCreatedExams] = useState([]);
     const [fraudLogs, setFraudLogs] = useState([]);
     const [fraudLoading, setFraudLoading] = useState(false);
+
+    // ---- Submissions state ----
+    const [submissions, setSubmissions] = useState([]);
+    const [submissionsLoading, setSubmissionsLoading] = useState(false);
+    const [totalStudents, setTotalStudents] = useState(0);
+    const [nameMap, setNameMap] = useState({}); // used for resolving hashes to names
 
     // ---- Enrollment state ----
     const [enrollWallet, setEnrollWallet] = useState('');
@@ -75,27 +82,84 @@ const AdminDashboard = ({ signer }) => {
         }
     };
 
-    // ---- Fetch Fraud Logs (AI + backend pipeline) ----
+    // ---- Fetch Fraud Logs (Blockchain immutable logs with backend fallback) ----
     const fetchFraudLogs = async () => {
         setFraudLoading(true);
         try {
-            const res = await fetch('http://localhost:5000/db/fraud-events?limit=200');
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
-            const logs = (data.events || []).map((event, idx) => {
-                const percent = Number(
-                    event.composite_score ?? Math.round((Number(event.fraud_score) || 0) * 100)
-                );
-                return {
-                    index: idx,
-                    studentID: event.student_address,
-                    examID: Number(event.exam_id ?? 0),
-                    riskScore: percent,
-                    timestamp: event.detected_at ? new Date(event.detected_at).toLocaleString() : '-',
-                    evidenceHash: event.evidence_hash,
-                    txHash: event.tx_hash || null,
-                };
-            });
+            let logs = [];
+            // Step 1: Try fetching immutable logs from the specialized FraudLog contract
+            if (signer && FRAUD_LOG_ADDRESS) {
+                try {
+                    const contract = new ethers.Contract(FRAUD_LOG_ADDRESS, FraudLogABI.abi, signer);
+                    // FraudLog contract stores event hashes in allEventHashes
+                    const count = await contract.totalEvents();
+                    // Build name hash map: keccak256(wallet.toLowerCase()) -> Name
+                    const regFilter = new ethers.Contract(CONTRACT_ADDRESS, ExamSystemABI.abi, signer).filters.UserRegistered();
+                    const regEvents = await new ethers.Contract(CONTRACT_ADDRESS, ExamSystemABI.abi, signer).queryFilter(regFilter);
+                    const nameHashMap = {};
+                    regEvents.forEach(e => {
+                        const addr = e.args[0].toLowerCase();
+                        const hash = ethers.keccak256(ethers.toUtf8Bytes(addr));
+                        nameHashMap[hash] = e.args[1];
+                    });
+                    setNameMap(prev => ({ ...prev, ...nameHashMap })); // store locally if needed
+
+                    const chainLogs = [];
+
+                    for (let i = 0; i < Number(count); i++) {
+                        const hash = await contract.allEventHashes(i);
+                        const details = await contract.getEventDetails(hash);
+                        const studentName = nameHashMap[details.studentHash] || `Student #${details.studentHash.substring(2, 8)}`;
+                        // Convert bytes32 studentHash back to something readable (or just show the hash)
+                        // Note: FraudLog stores studentHash = keccak256(studentAddress)
+                        chainLogs.push({
+                            index: i + 1,
+                            studentID: studentName,
+                            studentAddrHash: details.studentHash,
+                            examID: "N/A", // FraudLog doesn't store examID directly in the main struct
+                            riskScore: Number(details.fraudScore),
+                            timestamp: new Date(Number(details.timestamp) * 1000).toLocaleString(),
+                            evidenceHash: details.eventHash,
+                            txHash: 'ON-CHAIN',
+                            version: details.modelVersion
+                        });
+                    }
+                    logs = chainLogs.reverse();
+                } catch (chainErr) {
+                    console.error("Failed to fetch from specialized FraudLog contract:", chainErr);
+                }
+            }
+
+            // Step 2: Fallback to backend database if no logs on-chain yet
+            if (logs.length === 0) {
+                const res = await fetch('http://localhost:5000/db/fraud-events?limit=200');
+                if (res.ok) {
+                    const data = await res.json();
+
+                    // Also need a text name map for raw addresses in DB
+                    const contract = new ethers.Contract(CONTRACT_ADDRESS, ExamSystemABI.abi, signer);
+                    const regFilter = contract.filters.UserRegistered();
+                    const regEvents = await contract.queryFilter(regFilter);
+                    const rawNameMap = {};
+                    regEvents.forEach(e => rawNameMap[e.args[0].toLowerCase()] = e.args[1]);
+
+                    logs = (data.events || []).map((event, idx) => {
+                        const percent = Number(
+                            event.composite_score ?? Math.round((Number(event.fraud_score) || 0) * 100)
+                        );
+                        const sAddr = (event.student_address || '').toLowerCase();
+                        return {
+                            index: idx + 1,
+                            studentID: rawNameMap[sAddr] || (sAddr ? `ID: ${sAddr.substring(0, 8)}` : 'Unknown'),
+                            examID: Number(event.exam_id ?? 0),
+                            riskScore: percent,
+                            timestamp: event.detected_at ? new Date(event.detected_at).toLocaleString() : '-',
+                            evidenceHash: event.evidence_hash,
+                            txHash: event.tx_hash || null,
+                        };
+                    });
+                }
+            }
             setFraudLogs(logs);
         } catch (err) {
             console.error("Failed to read fraud logs:", err.message);
@@ -108,7 +172,77 @@ const AdminDashboard = ({ signer }) => {
         if (activeTab === 'view') fetchCreatedExams();
         if (activeTab === 'fraud') fetchFraudLogs();
         if (activeTab === 'enroll') setEnrolledList([]); // reset on tab switch
+        if (activeTab === 'results') {
+            fetchSubmissions();
+            fetchTotalStudents();
+        }
     }, [activeTab]);
+
+    const fetchTotalStudents = async () => {
+        try {
+            const contract = new ethers.Contract(CONTRACT_ADDRESS, ExamSystemABI.abi, signer);
+            const filter = contract.filters.UserRegistered();
+            const events = await contract.queryFilter(filter);
+            // Unique addresses only
+            const uniqueStudents = new Set(events.map(e => e.args[0].toLowerCase()));
+            setTotalStudents(uniqueStudents.size);
+        } catch (err) {
+            console.error("Failed to fetch total students:", err);
+        }
+    };
+
+    // ---- Fetch Submissions (ExamSubmitted logs) ----
+    const fetchSubmissions = async () => {
+        setSubmissionsLoading(true);
+        try {
+            const contract = new ethers.Contract(CONTRACT_ADDRESS, ExamSystemABI.abi, signer);
+
+            // Get all registration events to map names
+            const regFilter = contract.filters.UserRegistered();
+            const regEvents = await contract.queryFilter(regFilter);
+            const nameMap = {};
+            regEvents.forEach(e => {
+                nameMap[e.args[0].toLowerCase()] = e.args[1];
+            });
+
+            const filter = contract.filters.ExamSubmitted();
+            const events = await contract.queryFilter(filter);
+
+            const loaded = events.map(e => ({
+                student: e.args[0],
+                studentName: nameMap[e.args[0].toLowerCase()] || 'Unknown Student',
+                examId: Number(e.args[1]),
+                score: Number(e.args[2]),
+                txHash: e.transactionHash,
+                blockNumber: e.blockNumber
+            }));
+
+            // Sort chronologically to correctly number attempts
+            const sortedEvents = [...loaded].sort((a, b) => a.blockNumber - b.blockNumber);
+            const attemptTracker = {}; // key: wallet-examId
+
+            sortedEvents.forEach(sub => {
+                const key = `${sub.student.toLowerCase()}-${sub.examId}`;
+                attemptTracker[key] = (attemptTracker[key] || 0) + 1;
+                sub.attemptNumber = attemptTracker[key];
+            });
+
+            for (let i = 0; i < loaded.length; i++) {
+                try {
+                    const block = await signer.provider.getBlock(loaded[i].blockNumber);
+                    loaded[i].timestamp = new Date(block.timestamp * 1000).toLocaleString();
+                } catch (e) {
+                    loaded[i].timestamp = 'Unknown Time';
+                }
+            }
+
+            setSubmissions(loaded.reverse());
+        } catch (err) {
+            console.error("Failed to fetch submissions:", err);
+        } finally {
+            setSubmissionsLoading(false);
+        }
+    };
 
     // ---- Enroll a new user on-chain ----
     const handleEnroll = async () => {
@@ -262,6 +396,12 @@ const AdminDashboard = ({ signer }) => {
                         <List className="w-4 h-4" /> View Exams
                     </button>
                     <button
+                        onClick={() => setActiveTab('results')}
+                        className={`px-4 py-2 rounded-lg font-medium transition flex items-center gap-2 ${activeTab === 'results' ? 'bg-blue-600 text-white' : 'bg-blue-50 text-blue-600 hover:bg-blue-100'}`}
+                    >
+                        <FileText className="w-4 h-4" /> Submissions
+                    </button>
+                    <button
                         onClick={() => setActiveTab('fraud')}
                         className={`px-4 py-2 rounded-lg font-medium transition flex items-center gap-2 ${activeTab === 'fraud' ? 'bg-red-600 text-white' : 'bg-red-50 text-red-600 hover:bg-red-100'}`}
                     >
@@ -300,7 +440,7 @@ const AdminDashboard = ({ signer }) => {
                         <div>
                             <label className="block text-sm font-medium text-gray-700 mb-2">Exam Title</label>
                             <input
-                                className="w-full border p-3 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
+                                className="w-full border p-3 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none text-gray-900"
                                 placeholder="e.g. Final Semester Exam"
                                 value={examTitle}
                                 onChange={e => setExamTitle(e.target.value)}
@@ -309,7 +449,7 @@ const AdminDashboard = ({ signer }) => {
                         <div>
                             <label className="block text-sm font-medium text-gray-700 mb-2">Subject</label>
                             <input
-                                className="w-full border p-3 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
+                                className="w-full border p-3 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none text-gray-900"
                                 placeholder="e.g. Computer Science"
                                 value={subject}
                                 onChange={e => setSubject(e.target.value)}
@@ -331,7 +471,7 @@ const AdminDashboard = ({ signer }) => {
                                         Question {qIdx + 1}
                                     </label>
                                     <input
-                                        className="w-full border p-3 rounded-lg bg-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                                        className="w-full border p-3 rounded-lg bg-white focus:ring-2 focus:ring-indigo-500 outline-none text-gray-900"
                                         placeholder="Enter question text..."
                                         value={q.question}
                                         onChange={e => updateQuestion(qIdx, 'question', e.target.value)}
@@ -349,7 +489,7 @@ const AdminDashboard = ({ signer }) => {
                                                 title="Mark as correct answer"
                                             />
                                             <input
-                                                className="w-full border p-2 rounded-lg text-sm focus:ring-1 focus:ring-indigo-400 outline-none"
+                                                className="w-full border p-2 rounded-lg text-sm focus:ring-1 focus:ring-indigo-400 outline-none text-gray-800"
                                                 placeholder={`Option ${oIdx + 1}${q.answer === oIdx ? ' ✓ Correct' : ''}`}
                                                 value={opt}
                                                 onChange={e => updateOption(qIdx, oIdx, e.target.value)}
@@ -416,6 +556,57 @@ const AdminDashboard = ({ signer }) => {
                 </div>
             )}
 
+            {/* --- RESULTS/SUBMISSIONS TAB --- */}
+            {activeTab === 'results' && (
+                <div className="space-y-4">
+                    <div className="flex justify-between items-center mb-4">
+                        <div>
+                            <p className="text-sm text-gray-500 font-bold">{totalStudents} Total Registered Student(s)</p>
+                            <p className="text-xs text-gray-400">{submissions.length} submission(s) recorded</p>
+                        </div>
+                        <button
+                            onClick={() => { fetchSubmissions(); fetchTotalStudents(); }}
+                            disabled={submissionsLoading}
+                            className="text-blue-600 text-sm font-medium flex items-center gap-1 hover:underline disabled:opacity-50"
+                        >
+                            <RefreshCw className={`w-4 h-4 ${submissionsLoading ? 'animate-spin' : ''}`} /> Refresh
+                        </button>
+                    </div>
+                    {submissionsLoading && (
+                        <div className="text-center py-10 text-gray-500">Loading submissions from blockchain...</div>
+                    )}
+                    {!submissionsLoading && submissions.length === 0 && (
+                        <div className="text-center py-10 bg-gray-50 rounded-xl border border-dashed border-gray-200">
+                            No exam submissions found on blockchain.
+                        </div>
+                    )}
+                    {!submissionsLoading && submissions.map((sub, i) => (
+                        <div key={i} className={`bg-white p-6 rounded-xl border flex justify-between items-center shadow-sm hover:shadow-md transition ${sub.attemptNumber > 1 ? 'border-amber-200 bg-amber-50/20' : 'border-gray-200'}`}>
+                            <div>
+                                <div className="flex items-center gap-2">
+                                    <h3 className="text-base font-bold text-gray-800">{sub.studentName}</h3>
+                                    {sub.attemptNumber > 1 && (
+                                        <span className="bg-amber-100 text-amber-700 text-[10px] px-2 py-0.5 rounded-full font-bold border border-amber-200">
+                                            Attempt #{sub.attemptNumber}
+                                        </span>
+                                    )}
+                                </div>
+                                <p className="font-mono text-[10px] text-gray-500">{sub.student}</p>
+                                <p className="text-xs text-gray-500 mt-1">
+                                    Exam ID: #{sub.examId} • Time: {sub.timestamp}
+                                </p>
+                            </div>
+                            <div className="text-right">
+                                <div className="font-bold text-lg text-blue-600">{sub.score} Pts</div>
+                                <div className="text-[10px] text-gray-400 font-mono mt-1" title={sub.txHash}>
+                                    Tx: {sub.txHash.substring(0, 10)}...
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )}
+
             {/* --- FRAUD LOGS TAB --- */}
             {activeTab === 'fraud' && (
                 <div>
@@ -423,10 +614,10 @@ const AdminDashboard = ({ signer }) => {
                         <div>
                             <h3 className="text-xl font-bold text-gray-800 flex items-center gap-2">
                                 <AlertTriangle className="w-5 h-5 text-red-500" />
-                                Fraud Event Log (AI + Backend + FraudLog)
+                                Fraud Event Log (Blockchain Immutable Records)
                             </h3>
                             <p className="text-sm text-gray-500 mt-1">
-                                Live results are captured by the AI service and persisted in backend records; high-risk events are additionally anchored to blockchain.
+                                High-risk events are anchored to the blockchain and fetched securely via smart contract for an immutable audit trail.
                             </p>
                         </div>
                         <button
@@ -526,7 +717,7 @@ const AdminDashboard = ({ signer }) => {
                                     value={enrollWallet}
                                     onChange={e => setEnrollWallet(e.target.value)}
                                     placeholder="0x..."
-                                    className="w-full border border-gray-300 rounded-lg p-3 font-mono text-sm focus:ring-2 focus:ring-emerald-400 outline-none"
+                                    className="w-full border border-gray-300 rounded-lg p-3 font-mono text-sm focus:ring-2 focus:ring-emerald-400 outline-none text-gray-900"
                                 />
                             </div>
                             <div>
@@ -535,7 +726,7 @@ const AdminDashboard = ({ signer }) => {
                                     value={enrollMatric}
                                     onChange={e => setEnrollMatric(e.target.value)}
                                     placeholder="e.g. UNI/2024/001"
-                                    className="w-full border border-gray-300 rounded-lg p-3 text-sm focus:ring-2 focus:ring-emerald-400 outline-none"
+                                    className="w-full border border-gray-300 rounded-lg p-3 text-sm focus:ring-2 focus:ring-emerald-400 outline-none text-gray-900"
                                 />
                             </div>
                             <div>
@@ -543,7 +734,7 @@ const AdminDashboard = ({ signer }) => {
                                 <select
                                     value={enrollRole}
                                     onChange={e => setEnrollRole(Number(e.target.value))}
-                                    className="w-full border border-gray-300 rounded-lg p-3 text-sm focus:ring-2 focus:ring-emerald-400 outline-none bg-white"
+                                    className="w-full border border-gray-300 rounded-lg p-3 text-sm focus:ring-2 focus:ring-emerald-400 outline-none bg-white text-gray-900"
                                 >
                                     {ROLE_LABELS.map((label, i) => (
                                         <option key={i} value={i}>{ROLE_ICONS[i]} {label}</option>

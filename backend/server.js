@@ -396,26 +396,31 @@ app.post('/analyze-sequence', upload.array('frames', 16), async (req, res) => {
 
 // ── Blockchain Fraud Log Endpoint ─────────────────────────────────────────────
 app.get('/fraud-logs', async (req, res) => {
-    if (!contractABI) {
+    if (!fraudLogABI || !FRAUD_LOG_ADDRESS) {
         return res.status(503).json({
-            error: "ABI not loaded — run 'npx hardhat compile' then 'npx hardhat run scripts/deploy.js'",
+            error: "FraudLog contract/ABI not loaded.",
         });
     }
     try {
-        const contract = new ethers.Contract(CONTRACT_ADDRESS, contractABI, provider);
-        const fraudHistory = await contract.getFraudHistory();
+        const contract = new ethers.Contract(FRAUD_LOG_ADDRESS, fraudLogABI, provider);
+        const count = await contract.totalEvents();
+        const logs = [];
 
-        const logs = fraudHistory.map((event, idx) => ({
-            index: idx,
-            studentID: event.studentID,
-            examID: Number(event.examID),
-            riskScore: Number(event.riskScore),
-            riskPercent: `${Number(event.riskScore)}%`,
-            timestamp: new Date(Number(event.timestamp) * 1000).toISOString(),
-            evidenceHash: event.evidenceHash,
-        }));
+        for (let i = 0; i < Number(count); i++) {
+            const hash = await contract.allEventHashes(i);
+            const details = await contract.getEventDetails(hash);
+            logs.push({
+                index: i,
+                studentHash: details.studentHash,
+                riskScore: Number(details.fraudScore),
+                riskPercent: `${Number(details.fraudScore)}%`,
+                timestamp: new Date(Number(details.timestamp) * 1000).toISOString(),
+                eventHash: details.eventHash,
+                modelVersion: details.modelVersion
+            });
+        }
 
-        res.json({ total: logs.length, logs, contractAddress: CONTRACT_ADDRESS });
+        res.json({ total: logs.length, logs, contractAddress: FRAUD_LOG_ADDRESS });
     } catch (err) {
         res.status(500).json({ error: "Failed to read fraud logs.", detail: err.message });
     }
